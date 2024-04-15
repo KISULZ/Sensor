@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  postgres_sensor:
+    container_name: postgres_sensor
+    image: postgres:13.3
+    environment:
+      POSTGRES_DB: "postgres"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    command:
+      -p 5432
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5432" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  sensor-api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    container_name: sensor-api
+    image: process-api:1.0
+    build:
+      context: .
+      dockerfile: Sensor/dockerfiles/compose.Dockerfile
+    restart: on-failure
+    environment:
+      SERVER_PORT: 8079
+      SPRING_DATASOURCE_URL:  jdbc:postgresql://postgres_sensor:5432/postgres
+      URL_WEB_TOPIC: http://localhost:8079/%s
+    ports:
+      - "8079:8079"
+    depends_on:
+      postgres_sensor:
+        condition: service_healthy
+    links:
+      - postgres_sensor

@@ -1,0 +1,175 @@
+1 Build sensor.api jar:
+  stage: build-app
+  image: registry.metadata.by:5000/3.9.1-amazoncorretto-17
+  variables:
+    MODULE_NAME: "sensor.api"
+    MODULE_STAGING_URL: "api/sensor/v1/swagger-ui/index.html"
+    MODULE_PROD_URL: "api/sensor/v1/swagger-ui/index.html"
+  script:
+    - cd $CI_PROJECT_DIR/sensor.api
+    - mvn dependency:purge-local-repository -DmanualInclude=com.agsr.lib:errorcode:1.0.0
+    - mvn dependency:get -Dartifact=com.agsr.lib:errorcode:1.0.0 -DremoteRepositories=gitlab-maven::::https://gitlab.agsr.by/api/v4/projects/24/packages/maven -s settings.xml --update-snapshots
+    - mvn $MAVEN_OPTS package
+  after_script:
+    - !reference [ .notify ]
+  cache:
+    paths:
+      - ./.m2/repository
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/sensor.api/controller/target/sensor.controller.jar
+    expire_in: "2 days"
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - sensor.api/**/*
+        - kubernetes/sensor-api/**/*
+  tags:
+    - backend
+
+6 Build sensor.api docker image:
+  stage: build-docker
+  image:
+    name: registry.metadata.by:5000/kaniko-project/executor:debug
+    entrypoint: [""]
+  needs:
+    - "6 Build sensor.api jar"
+  variables:
+    MODULE_NAME: "sensor.api"
+    MODULE_STAGING_URL: "api/sensor/v1/swagger-ui/index.html"
+    MODULE_PROD_URL: "api/sensor/v1/swagger-ui/index.html"
+  before_script:
+    - echo "$DOCKER_AUTH_CONFIG" > /kaniko/.docker/config.json
+  script:
+    - cd $CI_PROJECT_DIR/sensor.api
+    - ls -lah
+    - mkdir ./build/
+    - cp ./controller/target/sensor.controller.jar ./build/
+    - cd ./build/
+    - >-
+      /kaniko/executor --context ./ --dockerfile ../dockerfiles/ci.Dockerfile
+      --destination registry.metadata.by:5000/registers-sensor-api:$CI_COMMIT_SHORT_SHA
+      --destination registry.metadata.by:5000/registers-sensor-api:latest
+  after_script:
+    - !reference [ .notify ]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^release/ || $CI_COMMIT_BRANCH =~ /^hotfix/
+      changes:
+        - sensor.api/**/*
+        - kubernetes/sensor-api/**/*
+  tags:
+    - docker
+
+.deploy-sensor-api-script: &deploy-sensor-api-script
+  - |
+    echo "$DOCKER_AUTH_CONFIG" > ./docker_config.json
+    echo "Set deployment image to registers-sensor:$CI_COMMIT_SHORT_SHA"
+    # устанавливаем версию образа (версия=хэш текущего коммита)
+    sed -i s/registers-sensor:latest/registers-sensor:$CI_COMMIT_SHORT_SHA/ $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-deployment.yml
+    # устанавливаем метку "Версия"
+    sed -i s/DEPLOYMENT_VERSION/$CI_COMMIT_SHORT_SHA/ $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-deployment.yml
+
+    # устанавливаем значения для версии сервиса
+    sed -i "s~TAG_PLACEHOLDER~$(git tag --points-at HEAD)~g" $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-conf.yml
+    sed -i "s~COMMIT_PLACEHOLDER~$CI_COMMIT_SHORT_SHA~g" $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-conf.yml
+    sed -i "s~BRANCH_PLACEHOLDER~$CI_COMMIT_BRANCH~g" $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-conf.yml
+    sed -i "s~BUILD_DATE_PLACEHOLDER~$(date '+%d-%m-%y %H:%M')~g" $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-conf.yml
+
+    if [ "$CI_ENVIRONMENT_NAME" == "staging" ]; then
+      kubectl config use-context $STAGING_USE_CONTEXT
+    else
+      kubectl config use-context $PROD_USE_CONTEXT
+    fi
+    # создаем секрет для скачивания образов из реестра (если он еще не создан)
+    kubectl create secret generic -n registers regcred --from-file=.dockerconfigjson=./docker_config.json --type=kubernetes.io/dockerconfigjson -o yaml --dry-run=client | kubectl apply -f -
+    # проверяем развернут ли сервис
+    kubectl get deployment -n registers registers-sensor-api-deployment > /dev/null 2>&1 || FAILED=true
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-service-account.yml
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-service.yml
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-conf.yml
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-db-secret.yml
+    kubectl delete -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-client-secret.yml --ignore-not-found
+    sleep 10
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-client-secret.yml
+    kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/$CI_ENVIRONMENT_NAME/registers-sensor-api-route.yml
+    if [ $FAILED ]; then
+      # deployment создается первый раз
+      # ждем пока SecretProviderClass создаст Secret
+      echo "first deploy"
+      sleep 10
+      kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-deployment.yml
+    else
+      # новая версия
+      echo "rollout new version"
+      kubectl apply -f $CI_PROJECT_DIR/kubernetes/sensor-api/common/registers-sensor-api-deployment.yml
+      kubectl rollout restart -n registers deployments/registers-sensor-api-deployment
+    fi
+    kubectl rollout status deployment/registers-sensor-api-deployment -n registers --timeout=240s || FAILED_DEPLOY=true
+    if [ $FAILED_DEPLOY ]; then
+      kubectl logs -n registers deployment/registers-sensor-api-deployment
+      exit 1
+    else
+      if [ "$CI_ENVIRONMENT_NAME" == "staging" ]; then
+        echo "checking endpoint $STAGING_URL/$MODULE_STAGING_URL"
+        curl -o /dev/null -s -w "%{http_code}\n" $STAGING_URL/$MODULE_STAGING_URL -f 
+      else
+        echo "checking endpoint $STAGING_URL/$MODULE_PROD_URL"
+        curl -o /dev/null -s -w "%{http_code}\n" $PROD_URL/$MODULE_PROD_URL -f 
+      fi
+    fi
+
+6 Deploy sensor.api to STAGING:
+  stage: deploy
+  image:
+    name: registry.metadata.by:5000/kubectl:latest
+    entrypoint: [""]
+  needs:
+    - "6 Build sensor.api docker image"
+  environment:
+    name: staging
+    url: $STAGING_URL
+  variables:
+    MODULE_NAME: "sensor.api"
+    MODULE_STAGING_URL: "api/sensor/v1/swagger-ui/index.html"
+    MODULE_PROD_URL: "api/sensor/v1/swagger-ui/index.html"
+  script:
+    - *deploy-sensor-api-script
+  after_script:
+    - !reference [ .notify ]
+  when: manual
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^release/ || $CI_COMMIT_BRANCH =~ /^hotfix/
+      changes:
+      - sensor.api/**/*
+      - kubernetes/sensor-api/**/*
+  tags:
+    - deploy
+
+6 Deploy sensor.api to PRODUCTION:
+  stage: deploy
+  image:
+    name: registry.metadata.by:5000/kubectl:latest
+    entrypoint: [""]
+  needs:
+    - "6 Build sensor.api docker image"
+  environment:
+    name: production
+    url: $PROD_URL
+  variables:
+    MODULE_NAME: "sensor.api"
+    MODULE_STAGING_URL: "api/sensor/v1/swagger-ui/index.html"
+    MODULE_PROD_URL: "api/sensor/v1/swagger-ui/index.html"
+  script:
+    - *deploy-sensor-api-script
+  after_script:
+    - !reference [ .notify ]
+  when: manual
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      changes:
+      - sensor.api/**/*
+      - kubernetes/sensor-api/**/*
+  tags:
+    - deploy
